@@ -1,17 +1,17 @@
 import { streamText } from 'ai'
+import { google } from '@ai-sdk/google'
 
 export async function POST(req: Request) {
   const { topic, allResponses } = await req.json()
-  
-  // Organize responses by round
+
   const roundsText = allResponses.map((round: { round: number; responses: { mindName: string; response: string }[] }) => {
-    return `Round ${round.round}:\n${round.responses.map((r: { mindName: string; response: string }) => 
+    return `Round ${round.round}:\n${round.responses.map((r: { mindName: string; response: string }) =>
       `${r.mindName}: ${r.response}`
     ).join('\n\n')}`
   }).join('\n\n---\n\n')
 
   const result = streamText({
-    model: 'openai/gpt-4o-mini',
+    model: google('gemini-2.5-flash'),
     system: `You are a neutral synthesizer analyzing a multi-perspective debate. Your role is to:
 1. Identify the key insights and strongest arguments from all perspectives
 2. Note areas of agreement and fundamental disagreements
@@ -31,7 +31,7 @@ ${roundsText}
 Please provide a synthesis of this debate, highlighting key insights and the strongest arguments from each perspective.`
       }
     ],
-    maxOutputTokens: 500,
+    maxOutputTokens: 1200,
   })
 
   return result.toTextStreamResponse()

@@ -1,19 +1,19 @@
 import { streamText } from 'ai'
+import { google } from '@ai-sdk/google'
 import { MINDS, type Mind } from '@/lib/minds'
 
 export async function POST(req: Request) {
   const { topic, mindId, round, previousResponses, settings } = await req.json()
-  
+
   const mind = MINDS.find((m: Mind) => m.id === mindId)
   if (!mind) {
     return new Response('Mind not found', { status: 404 })
   }
 
-  // Build context from previous responses
   let context = ''
   if (previousResponses && previousResponses.length > 0) {
-    context = '\n\nPrevious perspectives from other minds:\n' + 
-      previousResponses.map((r: { mindName: string; response: string }) => 
+    context = '\n\nPrevious perspectives from other minds:\n' +
+      previousResponses.map((r: { mindName: string; response: string }) =>
         `${r.mindName}: ${r.response}`
       ).join('\n\n')
   }
@@ -24,10 +24,9 @@ export async function POST(req: Request) {
     3: 'This is Round 3: Synthesis. Identify the strongest insights from the debate. Acknowledge valid opposing points. Offer your refined, nuanced final position.',
   }
 
-  const systemPrompt = `You are ${mind.name}, ${mind.description}
+  const systemPrompt = `You are ${mind.name}, ${mind.tagline}.
 
-Your personality and approach:
-${mind.personality}
+${mind.systemPrompt}
 
 ${roundInstructions[round as keyof typeof roundInstructions]}
 
@@ -39,7 +38,7 @@ Guidelines:
 - Be direct and impactful`
 
   const result = streamText({
-    model: 'openai/gpt-4o-mini',
+    model: google('gemini-2.5-flash'),
     system: systemPrompt,
     messages: [
       {
@@ -49,7 +48,7 @@ Guidelines:
 Now provide your ${round === 1 ? 'initial position' : round === 2 ? 'challenge and defense' : 'final synthesis'}.`
       }
     ],
-    maxOutputTokens: settings?.responseLength === 'short' ? 150 : settings?.responseLength === 'long' ? 400 : 250,
+    maxOutputTokens: settings?.responseLength === 'short' ? 500 : settings?.responseLength === 'long' ? 1200 : 800,
   })
 
   return result.toTextStreamResponse()
