@@ -57,7 +57,7 @@ export function Crucible() {
             { role: 'system', content: mind.systemPrompt },
             { role: 'user', content: prompt }
           ],
-          max_tokens: 250,
+          max_tokens: 800,
           stream: true
         })
       })
