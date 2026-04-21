@@ -6,15 +6,12 @@ import { Input } from '@/components/ui/input'
 import { MindCard } from '@/components/mind-card'
 import { RoundIndicator } from '@/components/round-indicator'
 import { SynthesisCard } from '@/components/synthesis-card'
-import { SettingsPanel } from '@/components/settings-panel'
-import { MINDS, type Response, type Round, type MindId, getRoundPrompt, getSynthesisPrompt } from '@/lib/minds'
+import { MINDS, type Response, type Round, type MindId } from '@/lib/minds'
 import { Flame } from 'lucide-react'
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 export function Crucible() {
-  const [apiKey, setApiKey] = useState('')
-  const [settingsOpen, setSettingsOpen] = useState(false)
   const [idea, setIdea] = useState('')
   const [isDebating, setIsDebating] = useState(false)
   const [currentRound, setCurrentRound] = useState<Round | null>(null)
@@ -30,35 +27,36 @@ export function Crucible() {
     ideaText: string,
     allResponses: Response[]
   ): Promise<Response> => {
-    const prompt = getRoundPrompt(round, ideaText, allResponses)
-    
     setActiveMinds(prev => new Set([...prev, mind.id]))
-    
-    // Add initial streaming response
+
     const initialResponse: Response = {
       mindId: mind.id,
       round,
       content: '',
       isStreaming: true
     }
-    
+
     setResponses(prev => [...prev, initialResponse])
-    
+
+    // Build previousResponses payload for the backend
+    const previousResponses = allResponses.map(r => {
+      const m = MINDS.find(mm => mm.id === r.mindId)
+      return {
+        mindName: m?.name ?? r.mindId,
+        response: r.content
+      }
+    })
+
     try {
-      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      const response = await fetch('/api/debate', {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [
-            { role: 'system', content: mind.systemPrompt },
-            { role: 'user', content: prompt }
-          ],
-          max_tokens: 800,
-          stream: true
+          topic: ideaText,
+          mindId: mind.id,
+          round,
+          previousResponses,
+          settings: { responseLength: 'long' }
         })
       })
 
@@ -75,38 +73,22 @@ export function Crucible() {
           const { done, value } = await reader.read()
           if (done) break
 
-          const chunk = decoder.decode(value)
-          const lines = chunk.split('\n').filter(line => line.trim() !== '')
+          const chunk = decoder.decode(value, { stream: true })
+          fullContent += chunk
 
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6)
-              if (data === '[DONE]') continue
-
-              try {
-                const parsed = JSON.parse(data)
-                const content = parsed.choices?.[0]?.delta?.content || ''
-                fullContent += content
-
-                setResponses(prev => {
-                  const updated = [...prev]
-                  const idx = updated.findIndex(
-                    r => r.mindId === mind.id && r.round === round && r.isStreaming
-                  )
-                  if (idx !== -1) {
-                    updated[idx] = { ...updated[idx], content: fullContent }
-                  }
-                  return updated
-                })
-              } catch {
-                // Skip invalid JSON
-              }
+          setResponses(prev => {
+            const updated = [...prev]
+            const idx = updated.findIndex(
+              r => r.mindId === mind.id && r.round === round && r.isStreaming
+            )
+            if (idx !== -1) {
+              updated[idx] = { ...updated[idx], content: fullContent }
             }
-          }
+            return updated
+          })
         }
       }
 
-      // Mark as complete
       setResponses(prev => {
         const updated = [...prev]
         const idx = updated.findIndex(
@@ -127,12 +109,9 @@ export function Crucible() {
       return { mindId: mind.id, round, content: fullContent, isStreaming: false }
     } catch (error) {
       console.error(`Error for ${mind.name}:`, error)
-      
-      // Update the streaming response to show error state
-      const errorMessage = error instanceof Error && error.message.includes('429')
-        ? '[Rate limited - please wait and try again]'
-        : `[Error: Could not get response]`
-      
+
+      const errorMessage = `[Error: Could not get response]`
+
       setResponses(prev => {
         const updated = [...prev]
         const idx = updated.findIndex(
@@ -143,80 +122,44 @@ export function Crucible() {
         }
         return updated
       })
-      
+
       setActiveMinds(prev => {
         const next = new Set(prev)
         next.delete(mind.id)
         return next
       })
-      
+
       throw error
     }
-  }, [apiKey])
+  }, [])
 
   const runRound = useCallback(async (round: Round, ideaText: string, allResponses: Response[]) => {
     setCurrentRound(round)
 
-    // Run minds sequentially to avoid rate limits
-    // Each mind gets all previous responses as context
     const roundResponses: Response[] = []
-    
+
     for (let i = 0; i < MINDS.length; i++) {
       const mind = MINDS[i]
-      
-      // Determine delay: 10 seconds for Synthesizer in Round 3, 5 seconds for all others
-      const isSynthesizerRound3 = mind.id === 'synthesizer' && round === 3
-      const delayMs = isSynthesizerRound3 ? 10000 : 5000
-      
-      // Add delay between ALL minds (except for very first call of round 1)
+
+      // Small delay between minds to be gentle with rate limits
       if (i > 0 || round > 1) {
-        await delay(delayMs)
+        await delay(1500)
       }
-      
-      // Synthesizer gets automatic retry logic (up to 3 retries with 15 second waits)
-      const maxRetries = mind.id === 'synthesizer' ? 3 : 1
-      let lastError: Error | null = null
-      
-      for (let attempt = 0; attempt < maxRetries; attempt++) {
-        try {
-          if (attempt > 0) {
-            // Clear the previous error response before retry
-            setResponses(prev => prev.filter(
-              r => !(r.mindId === mind.id && r.round === round)
-            ))
-            await delay(15000) // Wait 15 seconds before retry
-          }
-          
-          const response = await streamMindResponse(mind, round, ideaText, allResponses)
-          roundResponses.push(response)
-          lastError = null
-          break // Success, exit retry loop
-        } catch (error) {
-          lastError = error instanceof Error ? error : new Error('Unknown error')
-          console.error(`Mind ${mind.name} failed in round ${round} (attempt ${attempt + 1}/${maxRetries}):`, error)
-          
-          // Only retry for rate limits on Synthesizer
-          const isRateLimit = lastError.message.includes('429')
-          if (mind.id !== 'synthesizer' || !isRateLimit || attempt === maxRetries - 1) {
-            break
-          }
-        }
-      }
-      
-      // If all retries failed, add fallback response
-      if (lastError) {
-        const errorMessage = lastError.message.includes('429')
-          ? '[Rate limited - please wait and try again]'
-          : '[Error: Could not get response]'
+
+      try {
+        const response = await streamMindResponse(mind, round, ideaText, allResponses)
+        roundResponses.push(response)
+      } catch (error) {
+        console.error(`Mind ${mind.name} failed in round ${round}:`, error)
         roundResponses.push({
           mindId: mind.id,
           round,
-          content: errorMessage,
+          content: '[Error: Could not get response]',
           isStreaming: false
         })
       }
     }
-    
+
     return [...allResponses, ...roundResponses]
   }, [streamMindResponse])
 
@@ -224,23 +167,27 @@ export function Crucible() {
     setCurrentRound('final')
     setIsSynthesizing(true)
 
-    const prompt = getSynthesisPrompt(ideaText, allResponses)
+    // Group responses by round for the synthesis endpoint
+    const roundsMap = new Map<number, { mindName: string; response: string }[]>()
+    for (const r of allResponses) {
+      if (typeof r.round !== 'number') continue
+      const m = MINDS.find(mm => mm.id === r.mindId)
+      const arr = roundsMap.get(r.round) ?? []
+      arr.push({ mindName: m?.name ?? r.mindId, response: r.content })
+      roundsMap.set(r.round, arr)
+    }
+
+    const allResponsesPayload = Array.from(roundsMap.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([round, responses]) => ({ round, responses }))
 
     try {
-      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      const response = await fetch('/api/synthesis', {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [
-            { role: 'system', content: 'You are an impartial observer synthesizing a debate. Write clearly and insightfully.' },
-            { role: 'user', content: prompt }
-          ],
-          max_tokens: 600,
-          stream: true
+          topic: ideaText,
+          allResponses: allResponsesPayload
         })
       })
 
@@ -256,23 +203,8 @@ export function Crucible() {
           const { done, value } = await reader.read()
           if (done) break
 
-          const chunk = decoder.decode(value)
-          const lines = chunk.split('\n').filter(line => line.trim() !== '')
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6)
-              if (data === '[DONE]') continue
-
-              try {
-                const parsed = JSON.parse(data)
-                const content = parsed.choices?.[0]?.delta?.content || ''
-                setSynthesis(prev => prev + content)
-              } catch {
-                // Skip invalid JSON
-              }
-            }
-          }
+          const chunk = decoder.decode(value, { stream: true })
+          setSynthesis(prev => prev + chunk)
         }
       }
 
@@ -281,14 +213,9 @@ export function Crucible() {
       console.error('Synthesis error:', error)
       setIsSynthesizing(false)
     }
-  }, [apiKey])
+  }, [])
 
   const startDebate = async () => {
-    if (!apiKey) {
-      setSettingsOpen(true)
-      return
-    }
-
     if (!idea.trim()) return
 
     setIsDebating(true)
@@ -298,29 +225,15 @@ export function Crucible() {
     setActiveMinds(new Set())
 
     try {
-      // All 12 mind calls + 1 synthesis call are strictly sequential
-      // 5 second delay is applied before each call (except the very first)
-      
-      // Round 1 (4 minds)
       let allResponses = await runRound(1, idea, [])
-      
-      // Round 2 (4 minds) - delay handled inside runRound
       allResponses = await runRound(2, idea, allResponses)
-      
-      // Round 3 (4 minds) - delay handled inside runRound
       allResponses = await runRound(3, idea, allResponses)
-      
-      // Delay before synthesis
-      await delay(5000)
-      
-      // Final synthesis
+      await delay(1500)
       await streamSynthesis(idea, allResponses)
-      
     } catch (error) {
       console.error('Debate error:', error)
     }
-    
-    // Mark debate as complete but keep all state visible
+
     setIsDebating(false)
   }
 
@@ -336,13 +249,6 @@ export function Crucible() {
 
   return (
     <div className="min-h-screen bg-background">
-      <SettingsPanel
-        apiKey={apiKey}
-        onApiKeyChange={setApiKey}
-        isOpen={settingsOpen}
-        onToggle={() => setSettingsOpen(!settingsOpen)}
-      />
-
       <div className="container mx-auto px-4 py-8 max-w-7xl">
         {/* Header */}
         <header className="text-center mb-12">
@@ -381,11 +287,6 @@ export function Crucible() {
                 Enter the Crucible
               </Button>
             </div>
-            {!apiKey && (
-              <p className="text-sm text-muted-foreground mt-2 text-center">
-                Click the settings icon (⚙️) to add your Groq API key
-              </p>
-            )}
           </div>
         )}
 
